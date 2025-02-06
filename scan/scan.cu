@@ -45,9 +45,13 @@ static inline int nextPow2(int n) {
 __global__ void upsweep_kernel(int *device_data, int twod1, int twod,
                                int length) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index % twod1 == 0 && index < length)
+
+  if (index == length - 1)
+    device_data[index] = 0;
+  else if (index % twod1 == 0 && index < length)
     device_data[index + twod1 - 1] += device_data[index + twod - 1];
 }
+
 __global__ void downsweep_kernel(int *device_data, int twod1, int twod,
                                  int length) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -80,9 +84,12 @@ void exclusive_scan(int *device_data, int length) {
                                                 length);
     cudaCheckError(cudaDeviceSynchronize());
   }
-
+  // printf("we got:");
+  // for (int i = 0; i < length; i++)
+  //   printf("%d, ", device_data[i]);
+  // printf("\n");
   // WARNING this is probaly wrong!!!
-  device_data[length - 1] = 0;
+  // device_data[length - 1] = 0;
 
   for (int twod = length / 2; twod >= 1; twod /= 2) {
     int twod1 = twod * 2;
@@ -101,6 +108,10 @@ void exclusive_scan(int *device_data, int length) {
  * function above. You should not modify it.
  */
 double cudaScan(int *inarray, int *end, int *resultarray) {
+  printf("input:");
+  for (int i = 0; i < (end - inarray); i++)
+    printf("%d, ", inarray[i]);
+  printf("\n");
   int *device_data;
   // We round the array size up to a power of 2, but elements after
   // the end of the original input are left uninitialized and not checked
@@ -125,6 +136,12 @@ double cudaScan(int *inarray, int *end, int *resultarray) {
 
   cudaMemcpy(resultarray, device_data, (end - inarray) * sizeof(int),
              cudaMemcpyDeviceToHost);
+
+  printf("output:");
+  for (int i = 0; i < (end - inarray); i++)
+    printf("%d, ", resultarray[i]);
+
+  printf("\n");
   return overallDuration;
 }
 
