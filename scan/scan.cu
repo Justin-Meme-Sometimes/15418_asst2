@@ -4,12 +4,11 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
+#include "CycleTimer.h"
 #include <thrust/device_free.h>
 #include <thrust/device_malloc.h>
 #include <thrust/device_ptr.h>
 #include <thrust/scan.h>
-
-#include "CycleTimer.h"
 
 #define DEBUG
 #ifdef DEBUG
@@ -43,13 +42,16 @@ static inline int nextPow2(int n) {
 }
 
 __global__ void upsweep_kernel(int *device_data, int twod1, int twod,
-                               int length) {
+                               int length, bool set0Flag) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (index == length - 1)
-    device_data[index] = 0;
-  else if (index % twod1 == 0 && index < length)
-    device_data[index + twod1 - 1] += device_data[index + twod - 1];
+  if (index % twod1 == 0 && index < length) {
+    if (set0Flag && (index + twod1) == length)
+      device_data[index + twod1 - 1] = 0;
+    else
+      device_data[index + twod1 - 1] += device_data[index + twod - 1];
+    // printf("index: %d");
+  }
 }
 
 __global__ void downsweep_kernel(int *device_data, int twod1, int twod,
@@ -76,27 +78,32 @@ void exclusive_scan(int *device_data, int length) {
    * both the data array is sized to accommodate the next
    * power of 2 larger than the input.
    */
+  length = nextPow2(length);
   const int threadsPerBlock = 512;
   const int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+  bool set0Flag;
   for (int twod = 1; twod < length; twod *= 2) {
     int twod1 = twod * 2;
+    set0Flag = (twod * 2 >= length);
     upsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod1, twod,
-                                                length);
+                                                length, set0Flag);
+
     cudaCheckError(cudaDeviceSynchronize());
   }
+
+  // int *test = (int *)calloc(length, sizeof(int));
+  // cudaMemcpy(test, device_data, length * sizeof(int),
+  // cudaMemcpyDeviceToHost);
+
   // printf("we got:");
   // for (int i = 0; i < length; i++)
-  //   printf("%d, ", device_data[i]);
+  //   printf("%d, ", test[i]);
   // printf("\n");
-  // WARNING this is probaly wrong!!!
-  // device_data[length - 1] = 0;
 
   for (int twod = length / 2; twod >= 1; twod /= 2) {
     int twod1 = twod * 2;
-    /*
-      saxpy_kernel<<<blocks, threadsPerBlock>>>(N, alpha, device_x, device_y,
-                                            device_result);
-    */
+    // printf("iteration: %d", twod);
+
     downsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod1, twod,
                                                   length);
     cudaCheckError(cudaDeviceSynchronize());
@@ -108,10 +115,10 @@ void exclusive_scan(int *device_data, int length) {
  * function above. You should not modify it.
  */
 double cudaScan(int *inarray, int *end, int *resultarray) {
-  printf("input:");
-  for (int i = 0; i < (end - inarray); i++)
-    printf("%d, ", inarray[i]);
-  printf("\n");
+  // printf("input:");
+  // for (int i = 0; i < (end - inarray); i++)
+  //   printf("%d, ", inarray[i]);
+  // printf("\n");
   int *device_data;
   // We round the array size up to a power of 2, but elements after
   // the end of the original input are left uninitialized and not checked
@@ -137,11 +144,11 @@ double cudaScan(int *inarray, int *end, int *resultarray) {
   cudaMemcpy(resultarray, device_data, (end - inarray) * sizeof(int),
              cudaMemcpyDeviceToHost);
 
-  printf("output:");
-  for (int i = 0; i < (end - inarray); i++)
-    printf("%d, ", resultarray[i]);
+  // printf("output:");
+  // for (int i = 0; i < (end - inarray); i++)
+  //   printf("%d, ", resultarray[i]);
 
-  printf("\n");
+  // printf("\n");
   return overallDuration;
 }
 
@@ -229,16 +236,20 @@ int find_peaks(int *device_input, int length, int *device_output) {
   cudaDeviceSynchronize();
 
   exclusive_scan(device_prefixOneHot, length);
+
+  int *lenOutputArray = (int *)calloc(1, sizeof(int));
+  cudaMemcpy(lenOutputArray, device_prefixOneHot + (length - 1), sizeof(int),
+             cudaMemcpyDeviceToHost);
+
   populateOutput<<<blocks, threadsPerBlock>>>(
       device_oneHot, device_prefixOneHot, device_output);
-
   cudaDeviceSynchronize();
-  int outputLength = device_prefixOneHot[length - 1];
 
   cudaCheckError(cudaFree(device_oneHot));
   cudaCheckError(cudaFree(device_prefixOneHot));
-
-  return outputLength;
+  int lenOutput = lenOutputArray[0];
+  free(lenOutputArray);
+  return lenOutput;
 }
 
 /* Timing wrapper around find_peaks. You should not modify this function.
