@@ -115,6 +115,7 @@ __global__ void kernelClearImage(float r, float g, float b, float a) {
 // 
 // Update positions of fireworks
 __global__ void kernelAdvanceFireWorks() {
+
     const float dt = 1.f / 60.f;
     const float pi = M_PI;
     const float maxDist = 0.25f;
@@ -127,11 +128,13 @@ __global__ void kernelAdvanceFireWorks() {
     if (index >= cuConstRendererParams.numberOfCircles)
         return;
 
+    //where are NUM_FIREWORKS and NUM_SPARKS without defining them??
     if (0 <= index && index < NUM_FIREWORKS) { // firework center; no update 
         return;
     }
 
     // Determine the firework center/spark indices
+
     int fIdx = (index - NUM_FIREWORKS) / NUM_SPARKS;
     int sfIdx = (index - NUM_FIREWORKS) % NUM_SPARKS;
 
@@ -139,6 +142,8 @@ __global__ void kernelAdvanceFireWorks() {
     int sIdx = NUM_FIREWORKS + fIdx * NUM_SPARKS + sfIdx;
     int index3j = 3 * sIdx;
 
+
+    //The array indices index3i and index3k assume valid memory access without boundary access. (maybe out of bounds?)
     float cx = position[index3i];
     float cy = position[index3i+1];
 
@@ -323,6 +328,7 @@ __global__ void kernelAdvanceSnowflake() {
 // Given a pixel and a circle, determine the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
+//this code is not atomic at all so there are race conditions here
 __device__ __inline__ void
 shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
 
@@ -372,6 +378,10 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
+
+    //Race coniditons modifies the global memory without atomic operations
+    //leading to race conditions when multiple threads update the same pixel
+
     float4 existingColor = *imagePtr;
     float4 newColor;
     newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
@@ -380,6 +390,7 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
     newColor.w = alpha + existingColor.w;
 
     // Global memory write
+    //you should be careful
     *imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
@@ -390,6 +401,7 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
+//we need mutual exclusion to endsur etis
 __global__ void kernelRenderCircles() {
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -413,6 +425,7 @@ __global__ void kernelRenderCircles() {
     short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
 
     // A bunch of clamps.  Is there a CUDA built-in for this?
+    //replace with a cuda built-in
     short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
     short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
     short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
@@ -451,7 +464,10 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
 }
-
+//This a destructor to clean up emmeory
+//this is a good practice as it helps to avoid memory leaks
+//it's also a good practice to free up GPU memory before the program exits
+//if you forget to do this, you can end up with a program that crashes
 CudaRenderer::~CudaRenderer() {
 
     if (image) {
@@ -459,6 +475,7 @@ CudaRenderer::~CudaRenderer() {
     }
 
     if (position) {
+        //potenial double edelete and cudaFree issues
         delete [] position;
         delete [] velocity;
         delete [] color;
@@ -495,6 +512,8 @@ CudaRenderer::loadScene(SceneName scene) {
     sceneName = scene;
     loadCircleScene(sceneName, numberOfCircles, position, velocity, color, radius);
 }
+
+
 
 void
 CudaRenderer::setup() {
@@ -542,8 +561,10 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numberOfCircles);
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numberOfCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numberOfCircles);
+    //we don't know is image is initialized yet
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
 
+    //
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceColor, color, sizeof(float) * 3 * numberOfCircles, cudaMemcpyHostToDevice);
@@ -557,6 +578,8 @@ CudaRenderer::setup() {
     // here would have worked just as well.  See the Programmer's
     // Guide for more information about constant memory.
 
+
+    // no idea baout this
     GlobalConstants params;
     params.sceneName = sceneName;
     params.numberOfCircles = numberOfCircles;
@@ -568,6 +591,7 @@ CudaRenderer::setup() {
     params.radius = cudaDeviceRadius;
     params.imageData = cudaDeviceImageData;
 
+    //The cudaMemcpyToSymbol call useincorrect arguments ordering this should be spcicy cudaMemcpyHostToDevice
     cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
 
     // Also need to copy over the noise lookup tables, so we can
@@ -576,6 +600,7 @@ CudaRenderer::setup() {
     int* permY;
     float* value1D;
     getNoiseTables(&permX, &permY, &value1D);
+    //potenial issue here because we copy into constant read only memory
     cudaMemcpyToSymbol(cuConstNoiseXPermutationTable, permX, sizeof(int) * 256);
     cudaMemcpyToSymbol(cuConstNoiseYPermutationTable, permY, sizeof(int) * 256);
     cudaMemcpyToSymbol(cuConstNoise1DValueTable, value1D, sizeof(float) * 256);
