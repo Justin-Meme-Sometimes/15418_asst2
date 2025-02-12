@@ -14,6 +14,98 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#define SCAN_BLOCK_DIM 1024
+#define BLOCKSIZE 1024
+#include "circleBoxTest.cu_inl"
+
+#include <thrust/scan.h>
+
+#define cudaCheckError(ans) cudaAssert((ans), __FILE__, __LINE__);
+inline void cudaAssert(cudaError_t code, const char *file, int line,
+                       bool abort = true) {
+  if (code != cudaSuccess) {
+    fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(code), file,
+            line);
+    if (abort)
+      exit(code);
+  }
+}
+
+#define LOG2_WARP_SIZE 5U
+#define WARP_SIZE (1U << LOG2_WARP_SIZE)
+
+// Almost the same as naive scan1Inclusive, but doesn't need __syncthreads()
+// assuming size <= WARP_SIZE
+inline __device__ uint warpScanInclusive(int threadIndex, uint idata,
+                                         volatile uint *s_Data, uint size) {
+  // Note some of the calculations are obscure because they are optimized.
+  // For example, (threadIndex & (size - 1)) computes threadIndex % size,
+  // which works, assuming size is a power of 2.
+
+  uint pos = 2 * threadIndex - (threadIndex & (size - 1));
+  s_Data[pos] = 0;
+  pos += size;
+  s_Data[pos] = idata;
+
+  for (uint offset = 1; offset < size; offset <<= 1)
+    s_Data[pos] += s_Data[pos - offset];
+
+  return s_Data[pos];
+}
+
+inline __device__ uint warpScanExclusive(int threadIndex, uint idata,
+                                         volatile uint *sScratch, uint size) {
+  return warpScanInclusive(threadIndex, idata, sScratch, size) - idata;
+}
+
+__inline__ __device__ void sharedMemExclusiveScan(int threadIndex, uint *sInput,
+                                                  uint *sOutput,
+                                                  volatile uint *sScratch,
+                                                  uint size) {
+  assert(sInput[threadIndex] == 1 || sInput[threadIndex] == 0);
+  assert(sOutput[threadIndex] == 0);
+  assert(sScratch[2 * threadIndex] == 0 && sScratch[2 * threadIndex + 1] == 0);
+  if (size > WARP_SIZE) {
+
+    uint idata = sInput[threadIndex];
+
+    // Bottom-level inclusive warp scan
+    uint warpResult =
+        warpScanInclusive(threadIndex, idata, sScratch, WARP_SIZE);
+
+    // Save top elements of each warp for exclusive warp scan sync
+    // to wait for warp scans to complete (because s_Data is being
+    // overwritten)
+    __syncthreads();
+
+    if ((threadIndex & (WARP_SIZE - 1)) == (WARP_SIZE - 1))
+      sScratch[threadIndex >> LOG2_WARP_SIZE] = warpResult;
+
+    // wait for warp scans to complete
+    __syncthreads();
+
+    if (threadIndex < (SCAN_BLOCK_DIM / WARP_SIZE)) {
+      // grab top warp elements
+      uint val = sScratch[threadIndex];
+      // calculate exclusive scan and write back to shared memory
+      sScratch[threadIndex] =
+          warpScanExclusive(threadIndex, val, sScratch, size >> LOG2_WARP_SIZE);
+    }
+
+    // return updated warp scans with exclusive scan results
+    __syncthreads();
+
+    sOutput[threadIndex] =
+        warpResult + sScratch[threadIndex >> LOG2_WARP_SIZE] - idata;
+
+  } else if (threadIndex < WARP_SIZE) {
+    uint idata = sInput[threadIndex];
+    sOutput[threadIndex] =
+        warpScanExclusive(threadIndex, idata, sScratch, size);
+  }
+
+  assert(sOutput[threadIndex] < 1025);
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -374,9 +466,6 @@ __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p,
   // BEGIN SHOULD-BE-ATOMIC REGION
   // global memory read
 
-  // Race coniditons modifies the global memory without atomic operations
-  // leading to race conditions when multiple threads update the same pixel
-
   float4 existingColor = *imagePtr;
   float4 newColor;
   newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
@@ -385,7 +474,6 @@ __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p,
   newColor.w = alpha + existingColor.w;
 
   // Global memory write
-  // you should be careful
   *imagePtr = newColor;
 
   // END SHOULD-BE-ATOMIC REGION
@@ -398,55 +486,110 @@ __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p,
 // resulting image will be incorrect.
 // we need mutual exclusion to endsur etis
 __global__ void kernelRenderCircles() {
+
   short imageWidth = cuConstRendererParams.imageWidth;
   short imageHeight = cuConstRendererParams.imageHeight;
-  int pixelIndex = blockIdx.x * blockDim.x + threadIdx.x;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
   bool isSnow = cuConstRendererParams.sceneName == SNOWFLAKES ||
                 cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME;
 
-  for (int circleIndex = 0; circleIndex < cuConstRendererParams.numberOfCircles;
-       circleIndex++) {
-    float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
-    float rad = cuConstRendererParams.radius[circleIndex];
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+  int threadID = threadIdx.y * blockDim.x + threadIdx.x;
 
-    // Ethan: there is a built in to do this
-    short screenMinX =
-        (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX =
-        (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY =
-        (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY =
-        (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+  float invWidth = 1.f / imageWidth;
+  float invHeight = 1.f / imageHeight;
+  float boxL = invWidth * (static_cast<float>(blockIdx.x * blockDim.x) + 0.5f);
+  float boxR =
+      invWidth *
+      (static_cast<float>(blockIdx.x * blockDim.x + blockDim.x) + 0.5f);
+  float boxB = invHeight * (static_cast<float>(blockIdx.y * blockDim.y) + 0.5f);
+  float boxT =
+      invHeight *
+      (static_cast<float>(blockIdx.y * blockDim.y + blockDim.y) + 0.5f);
 
-    // Ethan: is there a clamp function for cuda????
-    //  short screenMinx = clamp(minX, 0, imageWidth);
-    //  short screenMaxX = clamp(maxX, 0, imageWidth);
-    //  short screenMinY = clamp(minY, 0, imageHight);
-    //  short screenMaxY = clamp(maxY, 0, imageHight);
+  __shared__ uint input_array[BLOCKSIZE];
+  __shared__ uint output_array[BLOCKSIZE];
+  __shared__ uint sScratch[BLOCKSIZE * 2];
+  sScratch[threadID * 2] = 0;
+  sScratch[threadID * 2 + 1] = 0;
+  output_array[threadID] = 0;
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+  int circleIndex = 0;
+  int isInbox;
 
-    int pixelX = pixelIndex % imageWidth;
-    int pixelY = pixelIndex / imageWidth;
+  for (int k = 0; k < cuConstRendererParams.numberOfCircles;
+       k += (BLOCKSIZE - 1)) {
+    __syncthreads();
+    // assert(threadID < 1024);
+    circleIndex = threadID + k;
+    sScratch[threadID * 2] = 0;
+    sScratch[threadID * 2 + 1] = 0;
+    output_array[threadID] = 0;
+    if (circleIndex < cuConstRendererParams.numberOfCircles &&
+        threadID < (BLOCKSIZE - 1)) {
+      float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
+      float rad = cuConstRendererParams.radius[circleIndex];
+      isInbox = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+    } else {
+      isInbox = 0;
+    }
+    input_array[threadID] = isInbox;
+    __syncthreads(); // bc we need complete input array
+    sharedMemExclusiveScan(threadID, input_array, output_array, sScratch,
+                           BLOCKSIZE);
+    __syncthreads();
+    uint outputIndex = output_array[threadID];
+    __syncthreads(); // because we are modifying output array in next step
+    if (isInbox) {
+      assert(outputIndex < 1024);
+      output_array[outputIndex] = threadID + k;
+    }
+    __syncthreads();
 
-    if (pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY &&
-        pixelY < screenMaxY) {
-      float4 *imgPtr =
-          (float4 *)(&cuConstRendererParams
-                          .imageData[4 * (pixelY * imageWidth + pixelX)]);
+    int length = output_array[BLOCKSIZE - 1];
 
-      float2 pixelCenterNorm =
-          make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                      invHeight * (static_cast<float>(pixelY) + 0.5f));
-      shadePixel(pixelCenterNorm, p, imgPtr, circleIndex, isSnow);
+    for (int i = 0; i < length; i++) {
+      circleIndex = output_array[i];
+
+      assert(circleIndex < cuConstRendererParams.numberOfCircles);
+
+      float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
+      float rad = cuConstRendererParams.radius[circleIndex];
+
+      short minX = static_cast<short>(imageWidth * (p.x - rad));
+      short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+      short minY = static_cast<short>(imageHeight * (p.y - rad));
+      short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+      // Ethan: there is a built in to do this
+      short screenMinX =
+          (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+      short screenMaxX =
+          (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+      short screenMinY =
+          (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+      short screenMaxY =
+          (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+      int pixelX = col;
+      int pixelY = row;
+
+      if (pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY &&
+          pixelY < screenMaxY) {
+        assert(pixelX < imageWidth && pixelY < imageHeight);
+        float4 *imgPtr =
+            (float4 *)(&cuConstRendererParams
+                            .imageData[4 * (pixelY * imageWidth + pixelX)]);
+
+        float2 pixelCenterNorm =
+            make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+                        invHeight * (static_cast<float>(pixelY) + 0.5f));
+
+        shadePixel(pixelCenterNorm, p, imgPtr, circleIndex, isSnow);
+      }
+      //__syncthreads();
     }
   }
+  //__syncthreads();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -591,9 +734,10 @@ void CudaRenderer::setup() {
   params.radius = cudaDeviceRadius;
   params.imageData = cudaDeviceImageData;
 
-  // The cudaMemcpyToSymbol call useincorrect arguments ordering this should be
-  // spcicy cudaMemcpyHostToDevice
-  cudaMemcpyToSymbol(cuConstRendererParams, &params, sizeof(GlobalConstants));
+  // The cudaMemcpyToSymbol call useincorrect arguments ordering this should
+  // be spcicy cudaMemcpyHostToDevice
+  cudaCheckError(cudaMemcpyToSymbol(cuConstRendererParams, &params,
+                                    sizeof(GlobalConstants)));
 
   // Also need to copy over the noise lookup tables, so we can
   // implement noise on the GPU
@@ -602,9 +746,12 @@ void CudaRenderer::setup() {
   float *value1D;
   getNoiseTables(&permX, &permY, &value1D);
   // potenial issue here because we copy into constant read only memory
-  cudaMemcpyToSymbol(cuConstNoiseXPermutationTable, permX, sizeof(int) * 256);
-  cudaMemcpyToSymbol(cuConstNoiseYPermutationTable, permY, sizeof(int) * 256);
-  cudaMemcpyToSymbol(cuConstNoise1DValueTable, value1D, sizeof(float) * 256);
+  cudaCheckError(cudaMemcpyToSymbol(cuConstNoiseXPermutationTable, permX,
+                                    sizeof(int) * 256));
+  cudaCheckError(cudaMemcpyToSymbol(cuConstNoiseYPermutationTable, permY,
+                                    sizeof(int) * 256));
+  cudaCheckError(cudaMemcpyToSymbol(cuConstNoise1DValueTable, value1D,
+                                    sizeof(float) * 256));
 
   // Copy over the color table that's used by the shading
   // function for circles in the snowflake demo
@@ -614,8 +761,8 @@ void CudaRenderer::setup() {
       {.8f, .9f, 1.f}, {.8f, 0.8f, 1.f},
   };
 
-  cudaMemcpyToSymbol(cuConstColorRamp, lookupTable,
-                     sizeof(float) * 3 * COLOR_MAP_SIZE);
+  cudaCheckError(cudaMemcpyToSymbol(cuConstColorRamp, lookupTable,
+                                    sizeof(float) * 3 * COLOR_MAP_SIZE));
 }
 
 // allocOutputImage --
@@ -671,13 +818,18 @@ void CudaRenderer::advanceAnimation() {
 }
 
 void CudaRenderer::render() {
-  // 256 threads per block is a healthy number
   short imageWidth = image->width;
   short imageHeight = image->height;
 
-  dim3 blockDim(256, 1);
-  dim3 gridDim((((imageWidth * imageHeight)) + blockDim.x - 1) / blockDim.x);
+  dim3 blockDim(32, 32);
+  dim3 gridDim((((imageWidth)) + (blockDim.x) - 1) / (blockDim.x),
+               (((imageHeight)) + (blockDim.y) - 1) / (blockDim.y), 1);
+  const int per_thread_storage = 2 * BLOCKSIZE * sizeof(uint) +
+                                 BLOCKSIZE * sizeof(uint) +
+                                 BLOCKSIZE * sizeof(uint);
+  printf("hello world!\n");
+  printf("CUDA Error: %s \n", cudaGetErrorString((cudaError_t)(0x0d)));
 
-  kernelRenderCircles<<<gridDim, blockDim>>>();
-  cudaDeviceSynchronize();
+  kernelRenderCircles<<<gridDim, blockDim, per_thread_storage>>>();
+  cudaCheckError(cudaDeviceSynchronize());
 }
