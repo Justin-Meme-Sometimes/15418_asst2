@@ -17,6 +17,7 @@
 #define SCAN_BLOCK_DIM 1024
 #define BLOCKSIZE 1024
 #include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
 
 #include <thrust/scan.h>
 
@@ -29,82 +30,6 @@ inline void cudaAssert(cudaError_t code, const char *file, int line,
     if (abort)
       exit(code);
   }
-}
-
-#define LOG2_WARP_SIZE 5U
-#define WARP_SIZE (1U << LOG2_WARP_SIZE)
-
-// Almost the same as naive scan1Inclusive, but doesn't need __syncthreads()
-// assuming size <= WARP_SIZE
-inline __device__ uint warpScanInclusive(int threadIndex, uint idata,
-                                         volatile uint *s_Data, uint size) {
-  // Note some of the calculations are obscure because they are optimized.
-  // For example, (threadIndex & (size - 1)) computes threadIndex % size,
-  // which works, assuming size is a power of 2.
-
-  uint pos = 2 * threadIndex - (threadIndex & (size - 1));
-  s_Data[pos] = 0;
-  pos += size;
-  s_Data[pos] = idata;
-
-  for (uint offset = 1; offset < size; offset <<= 1)
-    s_Data[pos] += s_Data[pos - offset];
-
-  return s_Data[pos];
-}
-
-inline __device__ uint warpScanExclusive(int threadIndex, uint idata,
-                                         volatile uint *sScratch, uint size) {
-  return warpScanInclusive(threadIndex, idata, sScratch, size) - idata;
-}
-
-__inline__ __device__ void sharedMemExclusiveScan(int threadIndex, uint *sInput,
-                                                  uint *sOutput,
-                                                  volatile uint *sScratch,
-                                                  uint size) {
-  assert(sInput[threadIndex] == 1 || sInput[threadIndex] == 0);
-  assert(sOutput[threadIndex] == 0);
-  assert(sScratch[2 * threadIndex] == 0 && sScratch[2 * threadIndex + 1] == 0);
-  if (size > WARP_SIZE) {
-
-    uint idata = sInput[threadIndex];
-
-    // Bottom-level inclusive warp scan
-    uint warpResult =
-        warpScanInclusive(threadIndex, idata, sScratch, WARP_SIZE);
-
-    // Save top elements of each warp for exclusive warp scan sync
-    // to wait for warp scans to complete (because s_Data is being
-    // overwritten)
-    __syncthreads();
-
-    if ((threadIndex & (WARP_SIZE - 1)) == (WARP_SIZE - 1))
-      sScratch[threadIndex >> LOG2_WARP_SIZE] = warpResult;
-
-    // wait for warp scans to complete
-    __syncthreads();
-
-    if (threadIndex < (SCAN_BLOCK_DIM / WARP_SIZE)) {
-      // grab top warp elements
-      uint val = sScratch[threadIndex];
-      // calculate exclusive scan and write back to shared memory
-      sScratch[threadIndex] =
-          warpScanExclusive(threadIndex, val, sScratch, size >> LOG2_WARP_SIZE);
-    }
-
-    // return updated warp scans with exclusive scan results
-    __syncthreads();
-
-    sOutput[threadIndex] =
-        warpResult + sScratch[threadIndex >> LOG2_WARP_SIZE] - idata;
-
-  } else if (threadIndex < WARP_SIZE) {
-    uint idata = sInput[threadIndex];
-    sOutput[threadIndex] =
-        warpScanExclusive(threadIndex, idata, sScratch, size);
-  }
-
-  assert(sOutput[threadIndex] < 1025);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -415,7 +340,7 @@ __global__ void kernelAdvanceSnowflake() {
 // this code is not atomic at all so there are race conditions here
 __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p,
                                       float4 *imagePtr, int circleIndex,
-                                      bool isSnow) {
+                                      bool isSnow, float3 rgbInput) {
 
   float diffX = p.x - pixelCenter.x;
   float diffY = p.y - pixelCenter.y;
@@ -457,7 +382,8 @@ __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p,
   } else {
     // Simple: each circle has an assigned color
     int index3 = 3 * circleIndex;
-    rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
+    // rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
+    rgb = rgbInput;
     alpha = .5f;
   }
 
@@ -510,12 +436,18 @@ __global__ void kernelRenderCircles() {
   __shared__ uint input_array[BLOCKSIZE];
   __shared__ uint output_array[BLOCKSIZE];
   __shared__ uint sScratch[BLOCKSIZE * 2];
-  sScratch[threadID * 2] = 0;
-  sScratch[threadID * 2 + 1] = 0;
-  output_array[threadID] = 0;
+  __shared__ float3 storedCoords[BLOCKSIZE];
+  __shared__ float3 storedRGB[BLOCKSIZE];
+  __shared__ float storedRads[BLOCKSIZE];
+  __shared__ float4 *storedImgPtr[BLOCKSIZE];
 
   int circleIndex = 0;
   int isInbox;
+  int pixelX = col;
+  int pixelY = row;
+  storedImgPtr[threadID] =
+      (float4 *)(&cuConstRendererParams
+                      .imageData[4 * (pixelY * imageWidth + pixelX)]);
 
   for (int k = 0; k < cuConstRendererParams.numberOfCircles;
        k += (BLOCKSIZE - 1)) {
@@ -525,37 +457,53 @@ __global__ void kernelRenderCircles() {
     sScratch[threadID * 2] = 0;
     sScratch[threadID * 2 + 1] = 0;
     output_array[threadID] = 0;
+    float3 p;
+    float rad;
     if (circleIndex < cuConstRendererParams.numberOfCircles &&
         threadID < (BLOCKSIZE - 1)) {
-      float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
-      float rad = cuConstRendererParams.radius[circleIndex];
+      p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
+      rad = cuConstRendererParams.radius[circleIndex];
+
       isInbox = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+
     } else {
       isInbox = 0;
     }
+    if (isInbox) {
+      storedCoords[threadID] = p;
+      storedRads[threadID] = rad;
+      if (!isSnow)
+        storedRGB[threadID] =
+            *(float3 *)&(cuConstRendererParams.color[circleIndex * 3]);
+    }
+
     input_array[threadID] = isInbox;
     __syncthreads(); // bc we need complete input array
     sharedMemExclusiveScan(threadID, input_array, output_array, sScratch,
                            BLOCKSIZE);
-    __syncthreads();
     uint outputIndex = output_array[threadID];
     __syncthreads(); // because we are modifying output array in next step
     if (isInbox) {
-      assert(outputIndex < 1024);
+      assert(outputIndex < BLOCKSIZE);
       output_array[outputIndex] = threadID + k;
     }
     __syncthreads();
 
     int length = output_array[BLOCKSIZE - 1];
-
+    // printf("length:%d\n", length);
+    //  assert(0);
     for (int i = 0; i < length; i++) {
       circleIndex = output_array[i];
 
-      assert(circleIndex < cuConstRendererParams.numberOfCircles);
+      // assert(circleIndex < 1024 && circleIndex < 0);
 
-      float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
-      float rad = cuConstRendererParams.radius[circleIndex];
-
+      // float3 p2 = *(float3 *)(&cuConstRendererParams.position[circleIndex *
+      // 3]); float rad2 = cuConstRendererParams.radius[circleIndex];
+      float3 p = storedCoords[circleIndex - k];
+      float rad = storedRads[circleIndex - k];
+      //__syncthreads();
+      // assert(rad == rad2);
+      // assert(p.x == p2.x && p.y == p2.y);
       short minX = static_cast<short>(imageWidth * (p.x - rad));
       short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
       short minY = static_cast<short>(imageHeight * (p.y - rad));
@@ -570,21 +518,20 @@ __global__ void kernelRenderCircles() {
           (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
       short screenMaxY =
           (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-      int pixelX = col;
-      int pixelY = row;
 
       if (pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY &&
           pixelY < screenMaxY) {
         assert(pixelX < imageWidth && pixelY < imageHeight);
-        float4 *imgPtr =
-            (float4 *)(&cuConstRendererParams
-                            .imageData[4 * (pixelY * imageWidth + pixelX)]);
+        float4 *imgPtr = storedImgPtr[threadID];
+        // (float4 *)(&cuConstRendererParams
+        //                 .imageData[4 * (pixelY * imageWidth + pixelX)]);
 
         float2 pixelCenterNorm =
             make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                         invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-        shadePixel(pixelCenterNorm, p, imgPtr, circleIndex, isSnow);
+        shadePixel(pixelCenterNorm, p, imgPtr, circleIndex, isSnow,
+                   storedRGB[(circleIndex - k)]);
       }
       //__syncthreads();
     }
@@ -824,12 +771,11 @@ void CudaRenderer::render() {
   dim3 blockDim(32, 32);
   dim3 gridDim((((imageWidth)) + (blockDim.x) - 1) / (blockDim.x),
                (((imageHeight)) + (blockDim.y) - 1) / (blockDim.y), 1);
-  const int per_thread_storage = 2 * BLOCKSIZE * sizeof(uint) +
-                                 BLOCKSIZE * sizeof(uint) +
-                                 BLOCKSIZE * sizeof(uint);
-  printf("hello world!\n");
-  printf("CUDA Error: %s \n", cudaGetErrorString((cudaError_t)(0x0d)));
+  const int per_thread_storage =
+      2 * BLOCKSIZE * sizeof(uint) + BLOCKSIZE * sizeof(uint) +
+      BLOCKSIZE * sizeof(uint) + BLOCKSIZE * sizeof(float3) +
+      BLOCKSIZE * sizeof(float);
 
-  kernelRenderCircles<<<gridDim, blockDim, per_thread_storage>>>();
+  kernelRenderCircles<<<gridDim, blockDim>>>();
   cudaCheckError(cudaDeviceSynchronize());
 }
