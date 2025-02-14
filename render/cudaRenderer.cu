@@ -498,14 +498,10 @@ __global__ void kernelRenderCircles() {
 
   float invWidth = 1.f / imageWidth;
   float invHeight = 1.f / imageHeight;
-  float boxL = invWidth * (static_cast<float>(blockIdx.x * blockDim.x) + 0.5f);
-  float boxR =
-      invWidth *
-      (static_cast<float>(blockIdx.x * blockDim.x + blockDim.x) + 0.5f);
-  float boxB = invHeight * (static_cast<float>(blockIdx.y * blockDim.y) + 0.5f);
-  float boxT =
-      invHeight *
-      (static_cast<float>(blockIdx.y * blockDim.y + blockDim.y) + 0.5f);
+  float boxL = invWidth * (blockIdx.x * blockDim.x + 0.5f);
+  float boxR = invWidth * (blockIdx.x * blockDim.x + blockDim.x + 0.5f);
+  float boxB = invHeight * (blockIdx.y * blockDim.y + 0.5f);
+  float boxT = invHeight * (blockIdx.y * blockDim.y + blockDim.y + 0.5f);
 
   __shared__ uint input_array[BLOCKSIZE];
   __shared__ uint output_array[BLOCKSIZE];
@@ -515,7 +511,7 @@ __global__ void kernelRenderCircles() {
   output_array[threadID] = 0;
 
   int circleIndex = 0;
-  int isInbox;
+  //int isInbox;
 
   for (int k = 0; k < cuConstRendererParams.numberOfCircles;
        k += (BLOCKSIZE - 1)) {
@@ -525,69 +521,46 @@ __global__ void kernelRenderCircles() {
     sScratch[threadID * 2] = 0;
     sScratch[threadID * 2 + 1] = 0;
     output_array[threadID] = 0;
+    input_array[threadID] = 0;
     if (circleIndex < cuConstRendererParams.numberOfCircles &&
         threadID < (BLOCKSIZE - 1)) {
       float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
       float rad = cuConstRendererParams.radius[circleIndex];
-      isInbox = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
-    } else {
-      isInbox = 0;
-    }
-    input_array[threadID] = isInbox;
+      input_array[threadID] = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+    } 
     __syncthreads(); // bc we need complete input array
     sharedMemExclusiveScan(threadID, input_array, output_array, sScratch,
                            BLOCKSIZE);
     __syncthreads();
     uint outputIndex = output_array[threadID];
     __syncthreads(); // because we are modifying output array in next step
-    if (isInbox) {
-      assert(outputIndex < 1024);
+    if (input_array[threadID]) {
+      //assert(outputIndex < 1024);
       output_array[outputIndex] = threadID + k;
     }
     __syncthreads();
 
     int length = output_array[BLOCKSIZE - 1];
 
-    for (int i = 0; i < length; i++) {
-      circleIndex = output_array[i];
+   for (int i = 0; i < length; i++) {
+    circleIndex = output_array[i];
+    
+    float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
+    float rad = cuConstRendererParams.radius[circleIndex];
 
-      assert(circleIndex < cuConstRendererParams.numberOfCircles);
+    // Precompute bounding box coordinates
+    short minX = max(0, static_cast<short>(imageWidth * (p.x - rad)));
+    short maxX = min(imageWidth, static_cast<short>(imageWidth * (p.x + rad) + 1));
+    short minY = max(0, static_cast<short>(imageHeight * (p.y - rad)));
+    short maxY = min(imageHeight, static_cast<short>(imageHeight * (p.y + rad) + 1));
 
-      float3 p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
-      float rad = cuConstRendererParams.radius[circleIndex];
-
-      short minX = static_cast<short>(imageWidth * (p.x - rad));
-      short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-      short minY = static_cast<short>(imageHeight * (p.y - rad));
-      short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-      // Ethan: there is a built in to do this
-      short screenMinX =
-          (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-      short screenMaxX =
-          (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-      short screenMinY =
-          (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-      short screenMaxY =
-          (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-      int pixelX = col;
-      int pixelY = row;
-
-      if (pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY &&
-          pixelY < screenMaxY) {
-        assert(pixelX < imageWidth && pixelY < imageHeight);
-        float4 *imgPtr =
-            (float4 *)(&cuConstRendererParams
-                            .imageData[4 * (pixelY * imageWidth + pixelX)]);
-
-        float2 pixelCenterNorm =
-            make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                        invHeight * (static_cast<float>(pixelY) + 0.5f));
-
+    if (col >= minX && col < maxX && row >= minY && row < maxY) {
+        float4 *imgPtr = (float4 *)(&cuConstRendererParams.imageData[4 * (row * imageWidth + col)]);
+        float2 pixelCenterNorm = make_float2(invWidth * (col + 0.5f), invHeight * (row + 0.5f));
         shadePixel(pixelCenterNorm, p, imgPtr, circleIndex, isSnow);
-      }
-      //__syncthreads();
     }
+  }
+
   }
   //__syncthreads();
 }
@@ -821,14 +794,12 @@ void CudaRenderer::render() {
   short imageWidth = image->width;
   short imageHeight = image->height;
 
-  dim3 blockDim(32, 32);
+  dim3 blockDim(32,32);
   dim3 gridDim((((imageWidth)) + (blockDim.x) - 1) / (blockDim.x),
                (((imageHeight)) + (blockDim.y) - 1) / (blockDim.y), 1);
-  const int per_thread_storage = 2 * BLOCKSIZE * sizeof(uint) +
-                                 BLOCKSIZE * sizeof(uint) +
-                                 BLOCKSIZE * sizeof(uint);
-  printf("hello world!\n");
-  printf("CUDA Error: %s \n", cudaGetErrorString((cudaError_t)(0x0d)));
+  const int per_thread_storage = 6 * BLOCKSIZE * sizeof(uint);
+  //printf("hello world!\n");
+  //printf("CUDA Error: %s \n", cudaGetErrorString((cudaError_t)(0x0d)));
 
   kernelRenderCircles<<<gridDim, blockDim, per_thread_storage>>>();
   cudaCheckError(cudaDeviceSynchronize());
