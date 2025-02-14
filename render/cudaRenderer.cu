@@ -340,7 +340,7 @@ __global__ void kernelAdvanceSnowflake() {
 // this code is not atomic at all so there are race conditions here
 __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p,
                                       float4 *imagePtr, int circleIndex,
-                                      bool isSnow, float3 rgbInput) {
+                                      bool isSnow) {
 
   float diffX = p.x - pixelCenter.x;
   float diffY = p.y - pixelCenter.y;
@@ -380,10 +380,8 @@ __device__ __inline__ void shadePixel(float2 pixelCenter, float3 p,
                                        0.f); // kCircleMaxAlpha * clamped value
     alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
   } else {
-    // Simple: each circle has an assigned color
     int index3 = 3 * circleIndex;
-    // rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-    rgb = rgbInput;
+    rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
     alpha = .5f;
   }
 
@@ -424,6 +422,7 @@ __global__ void kernelRenderCircles() {
 
   float invWidth = 1.f / imageWidth;
   float invHeight = 1.f / imageHeight;
+  // defines bounding box of block
   float boxL = invWidth * (static_cast<float>(blockIdx.x * blockDim.x) + 0.5f);
   float boxR =
       invWidth *
@@ -437,7 +436,8 @@ __global__ void kernelRenderCircles() {
   __shared__ uint output_array[BLOCKSIZE];
   __shared__ uint sScratch[BLOCKSIZE * 2];
   __shared__ float3 storedCoords[BLOCKSIZE];
-  __shared__ float3 storedRGB[BLOCKSIZE];
+  //__shared__ float3 storedRGB[BLOCKSIZE]; For some reason adding this breaks
+  // our code
   __shared__ float storedRads[BLOCKSIZE];
   __shared__ float4 *storedImgPtr[BLOCKSIZE];
 
@@ -445,40 +445,34 @@ __global__ void kernelRenderCircles() {
   int isInbox;
   int pixelX = col;
   int pixelY = row;
+  float3 p;  // circle coordinates
+  float rad; // circle radius
   storedImgPtr[threadID] =
-      (float4 *)(&cuConstRendererParams
-                      .imageData[4 * (pixelY * imageWidth + pixelX)]);
+      (float4
+           *)(&cuConstRendererParams
+                   .imageData[4 * (pixelY * imageWidth +
+                                   pixelX)]); // populates pixel ptr shated mem
 
   for (int k = 0; k < cuConstRendererParams.numberOfCircles;
        k += (BLOCKSIZE - 1)) {
-    __syncthreads();
-    // assert(threadID < 1024);
+
     circleIndex = threadID + k;
-    sScratch[threadID * 2] = 0;
-    sScratch[threadID * 2 + 1] = 0;
-    output_array[threadID] = 0;
-    float3 p;
-    float rad;
+    // checks if circle is inside block box
     if (circleIndex < cuConstRendererParams.numberOfCircles &&
         threadID < (BLOCKSIZE - 1)) {
       p = *(float3 *)(&cuConstRendererParams.position[circleIndex * 3]);
       rad = cuConstRendererParams.radius[circleIndex];
 
       isInbox = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
-
     } else {
       isInbox = 0;
     }
+    input_array[threadID] = isInbox;
+    __syncthreads(); // need since we are writing into shared memory
     if (isInbox) {
       storedCoords[threadID] = p;
       storedRads[threadID] = rad;
-      if (!isSnow)
-        storedRGB[threadID] =
-            *(float3 *)&(cuConstRendererParams.color[circleIndex * 3]);
     }
-
-    input_array[threadID] = isInbox;
-    __syncthreads(); // bc we need complete input array
     sharedMemExclusiveScan(threadID, input_array, output_array, sScratch,
                            BLOCKSIZE);
     uint outputIndex = output_array[threadID];
@@ -487,23 +481,20 @@ __global__ void kernelRenderCircles() {
       assert(outputIndex < BLOCKSIZE);
       output_array[outputIndex] = threadID + k;
     }
-    __syncthreads();
 
+    // last element of output_array contains number of circles because
+    // input_array is one-hot
     int length = output_array[BLOCKSIZE - 1];
-    // printf("length:%d\n", length);
-    //  assert(0);
+    __syncthreads(); // because we are reading output_array in for loop
     for (int i = 0; i < length; i++) {
       circleIndex = output_array[i];
 
       // assert(circleIndex < 1024 && circleIndex < 0);
-
-      // float3 p2 = *(float3 *)(&cuConstRendererParams.position[circleIndex *
-      // 3]); float rad2 = cuConstRendererParams.radius[circleIndex];
+      // loads circle information from shared memory
       float3 p = storedCoords[circleIndex - k];
       float rad = storedRads[circleIndex - k];
-      //__syncthreads();
-      // assert(rad == rad2);
-      // assert(p.x == p2.x && p.y == p2.y);
+
+      // compute bounding box coordinates
       short minX = static_cast<short>(imageWidth * (p.x - rad));
       short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
       short minY = static_cast<short>(imageHeight * (p.y - rad));
@@ -523,20 +514,15 @@ __global__ void kernelRenderCircles() {
           pixelY < screenMaxY) {
         assert(pixelX < imageWidth && pixelY < imageHeight);
         float4 *imgPtr = storedImgPtr[threadID];
-        // (float4 *)(&cuConstRendererParams
-        //                 .imageData[4 * (pixelY * imageWidth + pixelX)]);
 
         float2 pixelCenterNorm =
             make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                         invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-        shadePixel(pixelCenterNorm, p, imgPtr, circleIndex, isSnow,
-                   storedRGB[(circleIndex - k)]);
+        shadePixel(pixelCenterNorm, p, imgPtr, circleIndex, isSnow);
       }
-      //__syncthreads();
     }
   }
-  //__syncthreads();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -773,8 +759,10 @@ void CudaRenderer::render() {
                (((imageHeight)) + (blockDim.y) - 1) / (blockDim.y), 1);
   const int per_thread_storage =
       2 * BLOCKSIZE * sizeof(uint) + BLOCKSIZE * sizeof(uint) +
-      BLOCKSIZE * sizeof(uint) + BLOCKSIZE * sizeof(float3) +
-      BLOCKSIZE * sizeof(float);
+      BLOCKSIZE * sizeof(uint) + 2 * BLOCKSIZE * sizeof(float3) +
+      BLOCKSIZE * sizeof(float) + BLOCKSIZE * sizeof(float4 *);
+
+  printf("test: %d", sizeof(float4 *));
 
   kernelRenderCircles<<<gridDim, blockDim>>>();
   cudaCheckError(cudaDeviceSynchronize());
